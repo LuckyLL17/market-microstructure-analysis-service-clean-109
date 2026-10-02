@@ -7,6 +7,7 @@ export class OrderBook {
   private lastSequence = 0;
   private tradeCount = 0;
   private tradedQuantity = 0;
+  private unmatchedTradeQuantity = 0;
 
   constructor(public readonly symbol: string) {}
 
@@ -22,7 +23,8 @@ export class OrderBook {
     } else if (event.type === 'cancel_order' && event.orderId) {
       this.cancel(event.orderId);
     } else if (event.type === 'trade' && event.price && event.quantity) {
-      this.consume(event.aggressorSide ?? 'buy', event.quantity);
+      const unmatched = this.consume(event.aggressorSide ?? 'buy', event.quantity, event.price);
+      this.unmatchedTradeQuantity += unmatched;
       this.tradeCount += 1; this.tradedQuantity += event.quantity;
     }
   }
@@ -66,15 +68,21 @@ export class OrderBook {
     return fills;
   }
 
-  consume(aggressor: Side, quantity: number): void {
+  // A trade only consumes liquidity at prices the aggressor could actually have
+  // matched: asks at or below the trade price for a buy, bids at or above it for
+  // a sell. Levels beyond the trade price are left untouched, and any quantity
+  // the book cannot cover up to that price is returned as unmatched.
+  consume(aggressor: Side, quantity: number, tradePrice: number): number {
     const levels = aggressor === 'buy' ? this.asks : this.bids;
     let remaining = quantity;
     const prices = [...levels.keys()].sort((a, b) => aggressor === 'buy' ? a - b : b - a);
     for (const price of prices) {
+      if (aggressor === 'buy' ? price > tradePrice : price < tradePrice) break;
       const queue = levels.get(price) ?? [];
       while (queue.length && remaining > 0) { const item = queue[0]; const used = Math.min(remaining, item.remaining); item.remaining -= used; remaining -= used; if (item.remaining <= 0) queue.shift(); }
       if (!queue.length) levels.delete(price); if (remaining <= 0) break;
     }
+    return remaining;
   }
 
   snapshot(depth = 10): { bids: PriceLevel[]; asks: PriceLevel[]; sequence: number; timestamp: string } {
@@ -83,6 +91,6 @@ export class OrderBook {
 
   private seedLevel(side: Side, level: PriceLevel, sequence: number): void { this.add({ id: `seed-${side}-${level.price}`, side, price: level.price, quantity: level.quantity, remaining: level.quantity, sequence }); }
   private levels(map: Map<number, BookOrder[]>, side: Side, depth: number): PriceLevel[] { return [...map.entries()].sort((a, b) => side === 'buy' ? b[0] - a[0] : a[0] - b[0]).slice(0, depth).map(([price, orders]) => ({ price, quantity: +orders.reduce((sum, item) => sum + item.remaining, 0).toFixed(4) })); }
-  getStats() { return { tradeCount: this.tradeCount, tradedQuantity: this.tradedQuantity, sequence: this.lastSequence, timestamp: this.lastTimestamp }; }
+  getStats() { return { tradeCount: this.tradeCount, tradedQuantity: this.tradedQuantity, unmatchedTradeQuantity: +this.unmatchedTradeQuantity.toFixed(4), sequence: this.lastSequence, timestamp: this.lastTimestamp }; }
   queueAhead(side: Side, price: number): number { const queue = (side === 'buy' ? this.bids : this.asks).get(price) ?? []; return queue.reduce((sum, item) => sum + item.remaining, 0); }
 }
